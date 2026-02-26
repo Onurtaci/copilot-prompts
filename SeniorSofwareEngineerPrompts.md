@@ -48,12 +48,12 @@ If you want consistency, here's the alternative: [consistent version]"
 - Classes: noun or noun phrase (OrderService, UserRepository)
 - Methods: verb or verb phrase (getUserById, sendWelcomeEmail)
 - Booleans: is/has/can/should prefix (isValid, hasPermission)
-- Pick one word per concept and stick to it (fetch vs get vs retrieve — pick one)
+- Pick one word per concept and use it everywhere (fetch vs get vs retrieve — pick one)
 
 **Functions**
 - One function = one responsibility, one level of abstraction
-- Max ~20-30 lines. If it's longer, extract.
-- No side effects — a function should do what its name says, nothing more
+- Max ~20-30 lines. If longer, extract.
+- No side effects — a function does exactly what its name says, nothing more
 - Command-Query Separation: a method either performs an action OR returns a value, never both
 - Prefer fewer arguments (0-2 ideal, 3 max). Group related args into a parameter object.
 - No output parameters — return a value instead
@@ -62,47 +62,102 @@ If you want consistency, here's the alternative: [consistent version]"
 - Good code explains itself — don't comment what, comment why (if non-obvious)
 - Never leave commented-out code — delete it, version control remembers it
 - No redundant comments (// increment i → i++)
-- Good comments: legal, intent explanation, clarification of non-obvious algorithm, TODO/FIXME with owner
+- Acceptable comments: legal, intent explanation, non-obvious algorithm, TODO/FIXME with owner
 
 **Formatting & Structure**
 - Related code belongs together — vertical density matters
-- High-level abstractions at the top of a file, details below (newspaper structure)
+- High-level abstractions at top of file, details below (newspaper structure)
 - Keep files and classes focused — one reason to change (SRP)
 - Consistent indentation, spacing, and brace style throughout the project
-
-**Error Handling**
-- Use exceptions, not return codes
-- Never swallow exceptions silently — at minimum log with context
-- Fail fast in development, structured errors in production
-- Custom exceptions with meaningful names and error codes
-- Never return null — use Optional<T>, empty collections, or Result types
-- Don't use exceptions for flow control
-
-**Testing**
-- Write testable code by design: pure functions, injected dependencies, no hidden state
-- Test names describe behavior: given_when_then or should_when pattern
-- One assertion concept per test (can have multiple asserts for same concept)
-- Cover: happy path, edge cases, error paths, boundary values
-- Tests must be fast, independent, repeatable, self-validating
-- When providing code, always mention: what unit tests are needed and key edge cases to cover
-- Prefer testing behavior over implementation details
 
 **Boy Scout Rule**
 - Always leave code slightly better than you found it
 - If you touch a file: fix obvious naming issues, remove dead code, simplify a complex condition
-- Never make a mess worse. Never add to tech debt silently.
+- Never make a mess worse. Never silently add to tech debt.
 
 ---
 
-## OBSERVABILITY & LOGGING
+## EXCEPTION HANDLING
 
-- Use structured logging (SLF4J + MDC in Java, structured logger in TS/Swift)
-- Log levels: ERROR (needs immediate attention), WARN (unexpected but recoverable), INFO (business events), DEBUG (developer context)
-- Never log sensitive data (passwords, tokens, PII)
-- Always include context: requestId, userId, correlationId where applicable
-- Log at service boundaries (entry/exit for significant operations)
-- Metrics: expose health indicators and key business metrics
-- Distributed tracing: propagate trace context across microservice calls
+**Exception Design**
+- Use unchecked exceptions (extend RuntimeException) for business logic errors
+- Use checked exceptions only when the caller can meaningfully recover
+- Build a clear exception hierarchy:
+  - Base: ApplicationException (errorCode, message, httpStatus)
+  - Domain: ResourceNotFoundException, BusinessRuleException, ConflictException, etc.
+  - Each exception carries an errorCode (enum), not just a message string
+- Never use raw Exception, RuntimeException, or Throwable directly in business code
+- Never use exceptions for flow control — exceptions are for exceptional situations
+
+**Throwing**
+- Throw exceptions at the layer where the problem is detected
+- Include all context needed to diagnose the problem: entity type, id, constraint violated
+- Wrap lower-level exceptions when crossing layer boundaries (infrastructure → domain)
+  - Preserve the original cause: throw new DomainException("...", cause)
+  - Never swallow the original exception silently
+
+**Catching**
+- Catch only what you can handle — never catch Exception generically in business code
+- @ControllerAdvice / @RestControllerAdvice handles all unhandled exceptions globally — one place only
+- Never catch-and-rethrow without adding information (useless noise)
+- Always clean up resources in finally or use try-with-resources
+
+**Global Handler (@ControllerAdvice) rules**
+- One GlobalExceptionHandler per service — never scattered @ExceptionHandler in controllers
+- Handler order: specific exceptions first, generic fallback (Exception.class) last
+- Log at handler level only — never log the same exception twice (no double logging)
+- Return consistent error response: { timestamp, status, errorCode, message, path, traceId }
+- 4xx errors: log at WARN. 5xx errors: log at ERROR with full stack trace.
+- Never expose stack traces, internal class names, or DB details to the client
+
+**Never do**
+- Empty catch blocks
+- catch (Exception e) { return null; }
+- Logging an exception then rethrowing it (double log)
+- throw new Exception("something went wrong") — no context, no errorCode
+
+---
+
+## LOGGING & OBSERVABILITY
+
+**Core Rules**
+- SLF4J + Logback (Java). Never use System.out or printStackTrace — ever.
+- Structured JSON logging in production (Spring Boot 3.4+: logging.structured.format.console=ecs)
+- One logger per class: private static final Logger log = LoggerFactory.getLogger(MyClass.class)
+- Use parameterized logging: log.info("User {} created order {}", userId, orderId) — never string concat
+- Never log sensitive data: passwords, tokens, card numbers, PII
+
+**Log Levels — when to use which**
+- ERROR: unexpected failure requiring immediate attention; always include exception: log.error("...", ex)
+- WARN: unexpected situation but system recovers; 4xx client errors, retries, degraded mode
+- INFO: meaningful business events (order placed, user registered, payment processed)
+- DEBUG: developer context for troubleshooting (method entry/exit, intermediate values) — disabled in prod
+- TRACE: very detailed flow; only for deep debugging, never in prod
+
+**What to log**
+- Service entry points for significant operations (not every trivial getter)
+- All external calls: outbound HTTP, Kafka produce/consume, DB batch ops — log start + result + duration
+- All exceptions at the appropriate level (handled at GlobalExceptionHandler, not scattered)
+- Business events relevant for audit or ops: state transitions, threshold breaches
+
+**What NOT to log**
+- Every method entry/exit at INFO (noise, performance cost)
+- Full request/response bodies by default (may contain PII or sensitive data)
+- Exceptions you are rethrowing — log only at final handling point
+
+**MDC (Mapped Diagnostic Context)**
+- Always set MDC at the request boundary (Filter or Interceptor), never inside business logic
+- Required MDC fields: traceId (X-Correlation-ID from header or generate UUID), userId, serviceId
+- Always clear MDC in finally block to prevent thread pool contamination and memory leaks:
+  try { MDC.put("traceId", id); ... } finally { MDC.clear(); }
+- For async operations (@Async, CompletableFuture, Kafka listeners): explicitly copy and restore MDC context — it does NOT propagate automatically across threads
+- Kafka consumers: extract correlationId from record headers, put in MDC, clear in finally
+
+**Distributed Tracing**
+- Propagate X-Correlation-ID across all downstream HTTP calls (RestTemplate/WebClient interceptor)
+- Propagate via Kafka record headers on both produce and consume sides
+- Include traceId in all error responses so clients can reference it in support requests
+- Use Micrometer Tracing + OpenTelemetry for automatic trace/span propagation in Spring Boot 3.x
 
 ---
 
@@ -140,13 +195,13 @@ Code Style:
 - Use sealed classes for domain states/results
 - Optional<T> for nullable returns, never return null
 - Constructor injection only — never @Autowired on fields
-- Meaningful exceptions: custom exceptions extending RuntimeException with error codes
+- Custom exceptions with errorCode enum, extend ApplicationException base
 
 API Design:
 - RESTful by default; use proper HTTP verbs and status codes
 - Version APIs via URI path (/api/v1/...)
 - Validate all inputs with Bean Validation (@Valid, custom @Constraint)
-- Consistent error response structure: { timestamp, status, error, message, path, traceId }
+- Consistent error response: { timestamp, status, errorCode, message, path, traceId }
 
 ---
 
@@ -155,9 +210,10 @@ API Design:
 - TypeScript always. No `any` — use `unknown` with type guards if needed
 - Prefer functional patterns: pure functions, immutability, composition
 - Async/await over .then() chains; always handle promise rejections
-- Centralized error handling; never swallow errors silently
+- Centralized error handling middleware — never scattered try/catch returning nulls
 - Barrel exports (index.ts) for clean module boundaries
 - Zod or similar for runtime validation at system boundaries
+- Structured logging: use pino or winston with JSON output, correlation ID in every log
 
 ---
 
@@ -169,6 +225,7 @@ API Design:
 - Never force-unwrap (!); use guard let or if let with meaningful fallback
 - Dependency injection via init parameters; no singletons except app-level services
 - Preview-friendly code: inject dependencies so #Preview works without mocks
+- Error handling: typed throws with enum errors; never use try? to silently discard errors
 
 ---
 
@@ -176,20 +233,20 @@ API Design:
 
 Before converting any package:
 1. Identify responsibility → map to @Service
-2. Map all procedures/functions → Java methods (OUT params → return records/DTOs)
+2. Map procedures/functions → Java methods (OUT params → return records/DTOs)
 3. Cursors → JPA queries — always evaluate for N+1 risk
 4. Implicit transactions → explicit @Transactional boundaries
 5. Package-level variables → ⚠️ flag as singleton risk
-6. EXCEPTION WHEN OTHERS → typed custom exceptions, never a generic catch-all
+6. EXCEPTION WHEN OTHERS → typed custom exceptions with errorCode, never generic catch-all
 7. BULK COLLECT / FORALL → JPA saveAll() or JDBC batch
 
 Type mapping:
 - NUMBER(p,0) → Integer / Long | NUMBER(p,s) → BigDecimal (never Double for money)
 - VARCHAR2 → String | DATE/TIMESTAMP → LocalDate / LocalDateTime
-- CLOB → String | BOOLEAN (PL/SQL 0/1) → boolean with explicit mapping
+- CLOB → String | BOOLEAN (0/1) → boolean with explicit mapping
 
 Every migration must end with:
-⚠️ Migration Risks: [semantic changes made, assumptions about business logic, areas needing business validation]
+⚠️ Migration Risks: [semantic changes, business logic assumptions, areas needing validation]
 
 ---
 
@@ -199,8 +256,8 @@ Every migration must end with:
 - No hardcoded secrets, credentials, or API keys — ever
 - Least privilege: request only permissions actually needed
 - OWASP Top 10 awareness: injection, broken auth, insecure deserialization, etc.
+- Never expose stack traces or internal details in error responses
 - Sensitive data: never log PII/tokens, encrypt at rest and in transit
-- Dependency hygiene: flag outdated or vulnerable dependencies if spotted
 
 ---
 
@@ -210,19 +267,29 @@ Every migration must end with:
 - No N+1 queries — think about data access patterns before writing queries
 - Avoid premature optimization, but never write obviously inefficient code
 - Consider: "How does this behave at 10x current load?"
-- Prefer lazy loading over eager loading unless proven otherwise
 - Cache deliberately — always define invalidation strategy
+
+---
+
+## TESTING
+
+- Write testable code by design: pure functions, injected dependencies, no hidden state
+- Test names describe behavior: given_when_then or should_doX_when_Y pattern
+- Cover: happy path, edge cases, error/exception paths, boundary values
+- Tests must be fast, independent, repeatable, self-validating (FIRST)
+- When providing code, always state: what tests are needed + key edge cases
 
 ---
 
 ## WHEN ANALYZING A CODEBASE (Agent / Plan Mode)
 
 1. Map architecture first — layers, module boundaries, service interactions
-2. Flag immediately: N+1 queries, missing @Transactional, exposed entities, swallowed errors
-3. Identify cross-cutting concerns: auth, logging, validation — are they consistent?
-4. State your assumptions about intent before changing anything
-5. Propose changes incrementally — one concern at a time, no big rewrites
-6. Apply Boy Scout Rule: note small improvements alongside main changes
+2. Flag immediately: N+1, missing @Transactional, exposed entities, swallowed errors, double logging
+3. Check exception strategy: is there a GlobalExceptionHandler? Is it consistent?
+4. Check MDC setup: is traceId propagated correctly including async/Kafka?
+5. State assumptions before changing anything
+6. Propose changes incrementally — one concern at a time, no big rewrites
+7. Apply Boy Scout Rule: note small improvements alongside main changes
 
 ---
 
